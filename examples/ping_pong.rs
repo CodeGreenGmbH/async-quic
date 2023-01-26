@@ -1,8 +1,9 @@
 use async_net::UdpSocket;
 use async_quic::QuicEndpoint;
+use futures::prelude::*;
 use rcgen::generate_simple_self_signed;
 use rustls::{Certificate, PrivateKey};
-use smol::block_on;
+use smol::{block_on, spawn};
 use std::{net::Ipv6Addr, sync::Arc};
 
 fn main() {
@@ -23,11 +24,19 @@ fn main() {
         )))
     };
 
-    block_on(async {
+    let client_endpoint = block_on(async {
         let client_udp = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await.unwrap();
-        let server_udp = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await.unwrap();
-
-        let client_endpoint = QuicEndpoint::new(client_udp, None);
-        let server_endpoint = QuicEndpoint::new(server_udp, Some(server_config));
+        QuicEndpoint::new(client_udp, None)
     });
+    let mut server_endpoint = block_on(async {
+        let server_udp = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await.unwrap();
+        QuicEndpoint::new(server_udp, Some(server_config))
+    });
+
+    spawn(async move {
+        while let Some(conn) = server_endpoint.next().await {
+            spawn(async move { while let Some(event) = conn.next().await {} }).detach()
+        }
+    })
+    .detach();
 }

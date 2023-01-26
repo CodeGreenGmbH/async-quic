@@ -33,7 +33,7 @@ impl Stream for QuicEndpoint {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut state = self.inner.state.lock().unwrap();
         loop {
-            if let Some(transmit) = state.endpoint.poll_transmit() {
+            while let Some(transmit) = state.endpoint.poll_transmit() {
                 self.inner.transmit(transmit);
             }
             let mut b = BytesMut::zeroed(1600);
@@ -54,7 +54,7 @@ impl Stream for QuicEndpoint {
                     }
                 }
                 Some((handle, quinn_proto::DatagramEvent::NewConnection(conn))) => {
-                    let conn = QuicConnection::new(conn);
+                    let conn = QuicConnection::new(handle, conn, self.inner.clone());
                     state.connections.insert(handle, conn.inner());
                     return Poll::Ready(Some(conn));
                 }
@@ -70,7 +70,7 @@ pub(crate) struct EndpointInner {
 }
 
 impl EndpointInner {
-    fn transmit(&self, transmit: quinn_proto::Transmit) {
+    pub(crate) fn transmit(&self, transmit: quinn_proto::Transmit) {
         let future = self.udp.send_to(&transmit.contents, transmit.destination);
         let waker = noop_waker::noop_waker();
         let mut ctx = Context::from_waker(&waker);
@@ -80,9 +80,20 @@ impl EndpointInner {
             Poll::Pending => log::error!("transmit queue full"),
         }
     }
+    pub(crate) fn handle_enpoint_event(
+        &self,
+        handle: quinn_proto::ConnectionHandle,
+        event: quinn_proto::EndpointEvent,
+    ) -> Option<quinn_proto::ConnectionEvent> {
+        self.state
+            .lock()
+            .unwrap()
+            .endpoint
+            .handle_event(handle, event)
+    }
 }
 
-pub struct EndpointState {
+struct EndpointState {
     connections: BTreeMap<quinn_proto::ConnectionHandle, Arc<ConnectionInner>>,
     endpoint: quinn_proto::Endpoint,
 }

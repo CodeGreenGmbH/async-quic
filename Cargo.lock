@@ -110,6 +110,7 @@ name = "async-quic"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-io",
  "async-net",
  "bytes",
  "clap",
