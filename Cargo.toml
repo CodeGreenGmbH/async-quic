@@ -2,8 +2,8 @@
 name = "async-quic"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "runtime independent async quic implementation"
+license = "Apache-2.0 OR MIT"
 
 [dependencies]
 async-net = "1.7.0"
