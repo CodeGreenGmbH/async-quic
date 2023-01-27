@@ -47,12 +47,16 @@ pub(crate) struct ConnectionInner {
 impl ConnectionInner {
     pub(crate) fn handle_event(&self, event: quinn_proto::ConnectionEvent) {
         let mut guard = self.state.lock().unwrap();
-        guard.conn.handle_event(event)
+        guard.conn.handle_event(event);
+        if let Some(waker) = guard.conn_waker.take() {
+            waker.wake()
+        }
     }
     fn poll(self: &Arc<ConnectionInner>, cx: &mut Context<'_>) -> Poll<QuicConnectionEvent> {
         let mut guard = self.state.lock().unwrap();
+        guard.conn_waker = None;
         while let Some(transmit) = guard.conn.poll_transmit(Instant::now(), 1) {
-            self.endpoint.transmit(transmit)
+            self.endpoint.transmit(transmit);
         }
         loop {
             guard.timer = guard.conn.poll_timeout().map(Timer::at);
@@ -65,7 +69,7 @@ impl ConnectionInner {
         }
         while let Some(event) = guard.conn.poll_endpoint_events() {
             if let Some(event) = self.endpoint.handle_enpoint_event(self.handle, event) {
-                guard.conn.handle_event(event)
+                guard.conn.handle_event(event);
             }
         }
         while let Some(event) = guard.conn.poll() {
@@ -77,12 +81,12 @@ impl ConnectionInner {
                 }
                 quinn_proto::Event::DatagramReceived => log::error!("ignoring datagram"),
                 quinn_proto::Event::Stream(event) => match event {
-                    quinn_proto::StreamEvent::Opened { dir } => log::info!("incoming: {:?}", dir),
-                    quinn_proto::StreamEvent::Readable { id } => todo!(),
-                    quinn_proto::StreamEvent::Writable { id } => todo!(),
-                    quinn_proto::StreamEvent::Finished { id } => todo!(),
-                    quinn_proto::StreamEvent::Stopped { id, error_code } => todo!(),
-                    quinn_proto::StreamEvent::Available { dir } => todo!(),
+                    quinn_proto::StreamEvent::Opened { .. } => {} // ignore, because we check anyway
+                    quinn_proto::StreamEvent::Readable { id } => guard.wake(id, true, false),
+                    quinn_proto::StreamEvent::Writable { id } => guard.wake(id, false, true),
+                    quinn_proto::StreamEvent::Finished { id } => guard.wake(id, false, true),
+                    quinn_proto::StreamEvent::Stopped { id, .. } => guard.wake(id, true, false),
+                    quinn_proto::StreamEvent::Available { dir } => todo!("available: {}", dir),
                 },
             }
         }
@@ -102,27 +106,80 @@ impl ConnectionInner {
             )));
         }
         guard.conn_waker = Some(cx.waker().clone());
-        return Poll::Pending;
+        Poll::Pending
     }
-    pub(crate) fn recv_stream<F, R>(&self, id: quinn_proto::StreamId, f: F) -> R
-    where
-        F: FnOnce(quinn_proto::RecvStream) -> (R, Option<Waker>),
-    {
+    pub(crate) fn poll_read(
+        &self,
+        id: quinn_proto::StreamId,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<(usize, Option<quinn_proto::VarInt>)> {
         let mut guard = self.state.lock().unwrap();
-        let stream = guard.conn.recv_stream(id);
-        let (ret, waker) = f(stream);
-        guard.stream_wakers.get_mut(&id).unwrap()[0] = waker;
-        ret
+        guard.stream_wakers.get_mut(&id).unwrap()[0] = None;
+        let mut recv_stream = guard.conn.recv_stream(id);
+        let mut chunks = match recv_stream.read(true) {
+            Ok(chunks) => chunks,
+            Err(_) => return Poll::Ready((0, None)),
+        };
+        let mut n = 0usize;
+        let (blocked, err_code) = loop {
+            if buf.len() == n {
+                break (false, None);
+            }
+            match chunks.next(buf.len() - n) {
+                Ok(Some(chunk)) => {
+                    let m = n + chunk.bytes.len();
+                    buf[n..m].copy_from_slice(&chunk.bytes);
+                    n = m;
+                }
+                Ok(None) => break (false, None),
+                Err(quinn_proto::ReadError::Blocked) => break (true, None),
+                Err(quinn_proto::ReadError::Reset(err)) => break (false, Some(err)),
+            }
+        };
+        if chunks.finalize().should_transmit() {
+            if let Some(w) = guard.conn_waker.take() {
+                w.wake();
+            }
+        }
+        if n == 0 && blocked {
+            guard.stream_wakers.get_mut(&id).unwrap()[0] = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        return Poll::Ready((n, err_code));
     }
-    pub(crate) fn send_stream<F, R>(&self, id: quinn_proto::StreamId, f: F) -> R
-    where
-        F: FnOnce(quinn_proto::SendStream) -> (R, Option<Waker>),
-    {
+    pub(crate) fn poll_write(
+        &self,
+        id: quinn_proto::StreamId,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Option<quinn_proto::VarInt>>> {
         let mut guard = self.state.lock().unwrap();
-        let stream = guard.conn.send_stream(id);
-        let (ret, waker) = f(stream);
-        guard.stream_wakers.get_mut(&id).unwrap()[1] = waker;
-        ret
+        guard.stream_wakers.get_mut(&id).unwrap()[1] = None;
+        let mut send_stream = guard.conn.send_stream(id);
+        match send_stream.write(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(quinn_proto::WriteError::Blocked) => {
+                guard.stream_wakers.get_mut(&id).unwrap()[1] = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Err(quinn_proto::WriteError::Stopped(err_code)) => Poll::Ready(Err(Some(err_code))),
+            Err(quinn_proto::WriteError::UnknownStream) => Poll::Ready(Err(None)),
+        }
+    }
+    pub(crate) fn close(
+        &self,
+        id: quinn_proto::StreamId,
+        _cx: &mut Context<'_>,
+    ) -> Result<(), Option<quinn_proto::VarInt>> {
+        let mut guard = self.state.lock().unwrap();
+        guard.stream_wakers.get_mut(&id).unwrap()[1] = None;
+        let mut send_stream = guard.conn.send_stream(id);
+        match send_stream.finish() {
+            Ok(()) => Ok(()),
+            Err(quinn_proto::FinishError::Stopped(err_code)) => Err(Some(err_code)),
+            Err(quinn_proto::FinishError::UnknownStream) => Err(None),
+        }
     }
 }
 
@@ -141,7 +198,38 @@ struct ConnectionState {
     stream_wakers: BTreeMap<quinn_proto::StreamId, [Option<Waker>; 2]>,
 }
 
+impl ConnectionState {
+    fn wake(&mut self, id: quinn_proto::StreamId, r: bool, w: bool) {
+        if let Some(wakers) = self.stream_wakers.get_mut(&id) {
+            if r {
+                if let Some(waker) = wakers[0].take() {
+                    waker.wake();
+                }
+            }
+            if w {
+                if let Some(waker) = wakers[1].take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
+}
 pub enum QuicConnectionEvent {
     StreamR(QuicStream<true, false>),
     StreamRW(QuicStream<true, true>),
+}
+
+impl QuicConnectionEvent {
+    pub fn stream_r(self) -> Option<QuicStream<true, false>> {
+        match self {
+            Self::StreamR(stream) => Some(stream),
+            _ => None,
+        }
+    }
+    pub fn stream_rw(self) -> Option<QuicStream<true, true>> {
+        match self {
+            Self::StreamRW(stream) => Some(stream),
+            _ => None,
+        }
+    }
 }

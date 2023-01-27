@@ -1,8 +1,9 @@
-use async_net::UdpSocket;
+use async_io::Async;
 use bytes::BytesMut;
 use futures::prelude::*;
 use std::{
     collections::BTreeMap,
+    net::UdpSocket,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -16,7 +17,10 @@ pub struct QuicEndpoint {
 }
 
 impl QuicEndpoint {
-    pub fn new(udp: UdpSocket, server_config: Option<Arc<quinn_proto::ServerConfig>>) -> Self {
+    pub fn new(
+        udp: Async<UdpSocket>,
+        server_config: Option<Arc<quinn_proto::ServerConfig>>,
+    ) -> Self {
         let endpoint = quinn_proto::Endpoint::new(Arc::new(Default::default()), server_config);
         let state = Mutex::new(EndpointState {
             connections: BTreeMap::new(),
@@ -37,6 +41,7 @@ impl Stream for QuicEndpoint {
                 self.inner.transmit(transmit);
             }
             let mut b = BytesMut::zeroed(1600);
+            self.inner.udp.poll_readable(cx).is_ready();
             let (n, addr) = match Box::pin(self.inner.udp.recv_from(&mut b)).poll_unpin(cx) {
                 Poll::Ready(Ok((n, addr))) => (n, addr),
                 Poll::Ready(Err(err)) => {
@@ -65,7 +70,7 @@ impl Stream for QuicEndpoint {
 }
 
 pub(crate) struct EndpointInner {
-    udp: UdpSocket,
+    udp: Async<UdpSocket>,
     state: Mutex<EndpointState>,
 }
 
@@ -75,7 +80,7 @@ impl EndpointInner {
         let waker = noop_waker::noop_waker();
         let mut ctx = Context::from_waker(&waker);
         match Box::pin(future).poll_unpin(&mut ctx) {
-            Poll::Ready(Ok(_)) => todo!(),
+            Poll::Ready(Ok(_)) => {}
             Poll::Ready(Err(err)) => log::error!("transmit error: {:?}", err),
             Poll::Pending => log::error!("transmit queue full"),
         }
