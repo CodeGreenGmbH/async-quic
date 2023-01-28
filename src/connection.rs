@@ -8,7 +8,7 @@ use std::{
 
 use crate::{EndpointInner, QuicStream};
 use async_io::Timer;
-use futures::prelude::*;
+use futures::{channel::mpsc::Sender, prelude::*};
 
 pub struct QuicConnection {
     inner: Arc<ConnectionInner>,
@@ -19,12 +19,14 @@ impl QuicConnection {
         handle: quinn_proto::ConnectionHandle,
         conn: quinn_proto::Connection,
         endpoint: Arc<EndpointInner>,
+        transmit_sender: Sender<quinn_proto::Transmit>,
     ) -> Self {
         let state = Mutex::new(ConnectionState {
             conn,
             timer: None,
             stream_wakers: BTreeMap::new(),
             conn_waker: None,
+            transmit_sender,
         });
         let inner = Arc::new(ConnectionInner {
             state,
@@ -55,8 +57,11 @@ impl ConnectionInner {
     fn poll(self: &Arc<ConnectionInner>, cx: &mut Context<'_>) -> Poll<QuicConnectionEvent> {
         let mut guard = self.state.lock().unwrap();
         guard.conn_waker = None;
-        while let Some(transmit) = guard.conn.poll_transmit(Instant::now(), 1) {
-            self.endpoint.transmit(transmit);
+        let mgs = self.endpoint.udp_state().max_gso_segments();
+        while let Some(t) = guard.conn.poll_transmit(Instant::now(), mgs) {
+            if let Poll::Ready(Ok(())) = guard.transmit_sender.poll_ready(cx) {
+                guard.transmit_sender.start_send(t).unwrap()
+            }
         }
         loop {
             guard.timer = guard.conn.poll_timeout().map(Timer::at);
@@ -196,6 +201,7 @@ struct ConnectionState {
     timer: Option<Timer>,
     conn_waker: Option<Waker>,
     stream_wakers: BTreeMap<quinn_proto::StreamId, [Option<Waker>; 2]>,
+    transmit_sender: Sender<quinn_proto::Transmit>,
 }
 
 impl ConnectionState {

@@ -1,5 +1,5 @@
 use crate::QuicEndpoint;
-use async_io::{Async, Timer};
+use async_io::Timer;
 use futures::prelude::*;
 use rcgen::generate_simple_self_signed;
 use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig};
@@ -32,13 +32,12 @@ lazy_static::lazy_static! {
 }
 
 pub(crate) fn server() -> (QuicEndpoint, u16) {
-    let config = Arc::new(quinn_proto::ServerConfig::with_crypto(Arc::new(
-        SERVER_CONFIG.clone(),
-    )));
+    let config = Arc::new(SERVER_CONFIG.clone());
     block_on(async {
-        let server_udp = Async::<UdpSocket>::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap();
-        let port = server_udp.get_ref().local_addr().unwrap().port();
-        (QuicEndpoint::new(server_udp, Some(config)), port)
+        let udp = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+        let port = udp.local_addr().unwrap().port();
+        let endpoint = QuicEndpoint::new(udp, Some(config)).unwrap();
+        (endpoint, port)
     })
 }
 
