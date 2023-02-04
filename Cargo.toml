@@ -1,9 +1,13 @@
 [package]
 name = "async-quic"
-version = "0.3.0"
+version = "0.3.1"
+authors = ["Florian Uekermann <florian@uekermann.me>"]
 edition = "2021"
-description = "runtime independent async quic implementation"
+description = "runtime independent async quic implementation based on quinn-proto"
 license = "Apache-2.0 OR MIT"
+documentation = "https://docs.rs/async-quic"
+keywords = ["quic", "async",]
+categories = ["network-programming"]
 
 [dependencies]
 futures = "0.3.25"
