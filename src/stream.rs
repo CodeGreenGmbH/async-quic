@@ -5,7 +5,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::ConnectionInner;
+use crate::{error::Error, ConnectionInner};
+use bytes::Bytes;
 use futures::prelude::*;
 
 pub struct QuicStream<const R: bool, const W: bool> {
@@ -71,5 +72,49 @@ impl<const R: bool> AsyncWrite for QuicStream<R, true> {
             Ok(()) => Poll::Ready(Ok(())),
             Err(_) => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
         }
+    }
+}
+
+impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
+    type Error = Error;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        todo!()
+    }
+
+    fn send_data<T: Into<h3::quic::WriteBuf<Bytes>>>(
+        &mut self,
+        data: T,
+    ) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    fn poll_finish(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        todo!()
+    }
+
+    fn reset(&mut self, reset_code: u64) {
+        todo!()
+    }
+
+    fn id(&self) -> h3::quic::StreamId {
+        todo!()
+    }
+}
+
+impl<const W: bool> h3::quic::RecvStream for QuicStream<true, W> {
+    type Buf = Bytes;
+
+    type Error = Error;
+
+    fn poll_data(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<Self::Buf>, Self::Error>> {
+        todo!()
+    }
+
+    fn stop_sending(&mut self, error_code: u64) {
+        todo!()
     }
 }

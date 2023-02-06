@@ -6,8 +6,9 @@ use std::{
     time::Instant,
 };
 
-use crate::{EndpointInner, QuicStream};
+use crate::{error::Infallible, EndpointInner, QuicStream};
 use async_io::Timer;
+use bytes::Bytes;
 use futures::{channel::mpsc::Sender, prelude::*};
 
 pub struct QuicConnection {
@@ -37,6 +38,76 @@ impl QuicConnection {
     }
     pub(crate) fn inner(&self) -> Arc<ConnectionInner> {
         self.inner.clone()
+    }
+}
+
+impl h3::quic::Connection<Bytes> for QuicConnection {
+    type BidiStream = QuicStream<true, true>;
+    type SendStream = QuicStream<false, true>;
+    type RecvStream = QuicStream<true, false>;
+    type OpenStreams = Self;
+    type Error = Infallible;
+
+    fn poll_accept_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<Self::RecvStream>, Self::Error>> {
+        todo!()
+    }
+
+    fn poll_accept_bidi(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<Self::BidiStream>, Self::Error>> {
+        todo!()
+    }
+
+    fn poll_open_bidi(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Self::BidiStream, Self::Error>> {
+        todo!()
+    }
+
+    fn poll_open_send(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Self::SendStream, Self::Error>> {
+        todo!()
+    }
+
+    fn opener(&self) -> Self::OpenStreams {
+        let inner = self.inner();
+        QuicConnection { inner }
+    }
+
+    fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
+        todo!()
+    }
+}
+
+impl h3::quic::OpenStreams<Bytes> for QuicConnection {
+    type BidiStream = QuicStream<true, true>;
+    type SendStream = QuicStream<false, true>;
+    type RecvStream = QuicStream<true, false>;
+    type Error = Infallible;
+
+    fn poll_open_bidi(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Self::BidiStream, Self::Error>> {
+        todo!()
+    }
+
+    fn poll_open_send(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Self::SendStream, Self::Error>> {
+        todo!()
+    }
+
+    fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
+        todo!()
     }
 }
 
