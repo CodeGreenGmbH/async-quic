@@ -4,6 +4,7 @@ use futures::{
     channel::mpsc::{channel, Receiver, Sender},
     prelude::*,
     ready,
+    stream::FusedStream,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -16,7 +17,7 @@ use std::{
     time::Instant,
 };
 
-use crate::{ConnectionInner, QuicConnection};
+use crate::{ConnectionInner, QuicConnecting, QuicConnection};
 
 pub struct QuicEndpoint {
     inner: Arc<EndpointInner>,
@@ -54,10 +55,29 @@ impl QuicEndpoint {
         });
         Ok(Self { inner })
     }
+    pub fn connect(
+        &self,
+        config: Arc<rustls::ClientConfig>,
+        addr: SocketAddr,
+        server_name: &str,
+    ) -> Result<QuicConnecting, quinn_proto::ConnectError> {
+        let mut state = self.inner.state.lock().unwrap();
+        let config = quinn_proto::ClientConfig::new(config);
+        let (handle, conn) = state.endpoint.connect(config, addr, server_name)?;
+        let inner = ConnectionInner::new(
+            handle,
+            conn,
+            self.inner.clone(),
+            self.inner.transmit_sender.clone(),
+        );
+        state.connections.insert(handle, inner.clone());
+        let inner = Some(inner);
+        return Ok(QuicConnecting { inner });
+    }
 }
 
 impl Stream for QuicEndpoint {
-    type Item = QuicConnection;
+    type Item = QuicConnecting;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut state = self.inner.state.lock().unwrap();
@@ -75,14 +95,15 @@ impl Stream for QuicEndpoint {
                         }
                     }
                     Some((handle, quinn_proto::DatagramEvent::NewConnection(conn))) => {
-                        let conn = QuicConnection::new(
+                        let inner = ConnectionInner::new(
                             handle,
                             conn,
                             self.inner.clone(),
                             self.inner.transmit_sender.clone(),
                         );
-                        state.connections.insert(handle, conn.inner());
-                        return Poll::Ready(Some(conn));
+                        state.connections.insert(handle, inner.clone());
+                        let inner = Some(inner);
+                        return Poll::Ready(Some(QuicConnecting { inner }));
                     }
                     None => {}
                 }
@@ -93,6 +114,13 @@ impl Stream for QuicEndpoint {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+impl FusedStream for QuicEndpoint {
+    fn is_terminated(&self) -> bool {
+        // TODO
+        false
     }
 }
 

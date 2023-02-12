@@ -140,12 +140,14 @@ dependencies = [
  "env_logger",
  "futures",
  "h3",
+ "http",
  "lazy_static",
  "log",
  "noop-waker",
  "quinn",
  "quinn-proto",
  "quinn-udp",
+ "rand",
  "rcgen",
  "rustls",
  "simple_logger",
@@ -544,7 +546,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.0"
-source = "git+https://github.com/FlorianUekermann/h3#1f10a0bdfb1fd10c776a3837d2b66231df8f4639"
+source = "git+https://github.com/FlorianUekermann/h3?branch=traits#560a96a79c3a45a96930740d9efe54e7956b9d70"
 dependencies = [
  "bytes",
  "fastrand",

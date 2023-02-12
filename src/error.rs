@@ -39,3 +39,9 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<Error> for std::io::Error {
+    fn from(value: Error) -> Self {
+        value.0
+    }
+}
