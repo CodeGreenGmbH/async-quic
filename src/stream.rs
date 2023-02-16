@@ -6,14 +6,15 @@ use std::{
 };
 
 use crate::{error::Error, ConnectionInner};
-use bytes::Bytes;
-use futures::prelude::*;
+use bytes::{Buf, Bytes};
+use futures::{prelude::*, ready};
 
 pub struct QuicStream<const R: bool, const W: bool> {
     conn: Arc<ConnectionInner>,
     id: quinn_proto::StreamId,
+    writing: Option<h3::quic::WriteBuf<Bytes>>,
     read_err: Option<quinn_proto::VarInt>,
-    read_buf: Option<Bytes>,
+    read_buf: Option<h3::quic::WriteBuf<Bytes>>,
 }
 
 impl<const R: bool, const W: bool> QuicStream<R, W> {
@@ -21,6 +22,7 @@ impl<const R: bool, const W: bool> QuicStream<R, W> {
         Self {
             conn,
             id,
+            writing: None,
             read_err: None,
             read_buf: None,
         }
@@ -30,19 +32,37 @@ impl<const R: bool, const W: bool> QuicStream<R, W> {
 impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
     type Error = Error;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        todo!()
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        while let Some(data) = &mut self.writing {
+            match ready!(self.conn.poll_write(self.id, cx, data.chunk())) {
+                Ok(n) => data.advance(n),
+                Err(err) => {
+                    return Poll::Ready(Err(match err {
+                        Some(reason) => io::ErrorKind::ConnectionReset.into(),
+                        None => io::ErrorKind::BrokenPipe.into(),
+                    }))
+                }
+            }
+            if !data.has_remaining() {
+                self.writing = None;
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn send_data<T: Into<h3::quic::WriteBuf<Bytes>>>(
         &mut self,
         data: T,
     ) -> Result<(), Self::Error> {
-        todo!()
+        if self.writing.is_some() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.writing = Some(data.into());
+        Ok(())
     }
 
-    fn poll_finish(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        todo!()
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.conn.poll_finish(self.id, cx)
     }
 
     fn reset(&mut self, reset_code: u64) {
@@ -54,32 +74,32 @@ impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
     }
 }
 
-//impl<const R: bool> AsyncWrite for QuicStream<R, true> {
-//    fn poll_write(
-//            self: Pin<&mut Self>,
-//            cx: &mut Context<'_>,
-//            buf: &[u8],
-//            ) -> Poll<io::Result<usize>> {
-//        match self.conn.poll_write(self.id, cx, buf) {
-//            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
-//            Poll::Ready(Err(_)) => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
-//            Poll::Pending => Poll::Pending,
-//        }
-//    }
-//
-//    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-//        // TODO: Check if all data has been acked?
-//        Poll::Ready(Ok(()))
-//    }
-//
-//    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-//        // TODO: Check if all data and finish have been acked?
-//        match self.conn.close(self.id, cx) {
-//            Ok(()) => Poll::Ready(Ok(())),
-//            Err(_) => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
-//        }
-//    }
-//}
+impl<const R: bool> AsyncWrite for QuicStream<R, true> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.conn.poll_write(self.id, cx, buf) {
+            Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // TODO: Check if all data has been acked?
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // TODO: Check if all data and finish have been acked?
+        match self.conn.close(self.id, cx) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(_) => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+        }
+    }
+}
 
 impl<const W: bool> h3::quic::RecvStream for QuicStream<true, W> {
     type Buf = Bytes;

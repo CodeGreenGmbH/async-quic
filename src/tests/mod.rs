@@ -85,20 +85,27 @@ where
     let mut handling = FuturesUnordered::new();
     let mut driving = FuturesUnordered::new();
     loop {
+        dbg!("handle");
         if let ControlFlow::Break(r) = select! {
             c = ep.next() => {
-                let c = c.unwrap();
-                connecting.push(c);
+                if let Some(c) = c {
+                    connecting.push(c);
+                }
                 ControlFlow::Continue(())
             },
             c = connecting.next() => {
-                let c = c.unwrap().unwrap();
-                driving.push(c.driver());
-                handling.push(f(c));
+                if let Some(c) = c {
+                    let c = c.unwrap();
+                    driving.push(c.driver());
+                    handling.push(f(c));
+                }
                 ControlFlow::Continue(())
             },
             _ = driving.next() => ControlFlow::Continue(()),
-            r = handling.next() => r.unwrap(),
+            r = handling.next() => match r {
+                Some(r) => r,
+                None => ControlFlow::Continue(()),
+            },
         } {
             return r;
         }

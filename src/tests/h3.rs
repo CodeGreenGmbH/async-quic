@@ -1,6 +1,6 @@
-use std::{future::poll_fn, ops::ControlFlow};
-
 use crate::{tests::handle, QuicConnection, QuicEndpoint, QuicStream};
+use std::{future::poll_fn, ops::ControlFlow};
+use test_log::test;
 
 use super::{client, connect, server};
 use bytes::{Buf, Bytes};
@@ -15,7 +15,9 @@ where
 {
     connect(ep, port, |conn| {
         Box::pin(async {
+            dbg!("h3_connect");
             let (mut driver, sender) = h3::client::new(conn).await.unwrap();
+            dbg!("h3_connect");
             let mut driver = poll_fn(move |cx| driver.poll_close(cx).map(|r| r.unwrap())).fuse();
             let mut fut = f(sender).fuse();
             select! {
@@ -34,15 +36,18 @@ where
     T: Future<Output = ControlFlow<R>>,
 {
     handle(ep, |conn| async {
+        dbg!("h3_handle");
         let mut conn = h3::server::Connection::new(conn).await.unwrap();
+        dbg!("h3_handle");
         let mut handling = FuturesUnordered::new();
         loop {
+            dbg!("h3_handle");
             if let ControlFlow::Break(r) = select! {
-            a = conn.accept().fuse() => {
-                let (req, stream) = a.unwrap().unwrap();
-                handling.push(f(req, stream));
-                ControlFlow::Continue(())
-            },
+                a = conn.accept().fuse() => {
+                    let (req, stream) = a.unwrap().unwrap();
+                    handling.push(f(req, stream));
+                    ControlFlow::Continue(())
+                },
                 r = handling.next() => r.unwrap(),
             } {
                 return ControlFlow::Break(r);
@@ -53,10 +58,11 @@ where
 }
 
 #[test]
-fn echo_server() {
+fn echo() {
     let (server, port) = server();
     let handle_fut = h3_handle(server, |_, mut stream| {
         Box::pin(async move {
+            dbg!();
             let mut body = Vec::new();
             while let Some(b) = stream.recv_data().await.unwrap() {
                 body.extend_from_slice(b.chunk())
@@ -76,6 +82,7 @@ fn echo_server() {
     let client = client();
     let request_fut = Box::pin(h3_connect(client, port, |mut sender| {
         Box::pin(async move {
+            dbg!();
             let req = Request::new(());
             let mut stream = sender.send_request(req).await.unwrap();
             stream.send_data(Bytes::copy_from_slice(MSG)).await.unwrap();

@@ -12,7 +12,7 @@ impl h3::quic::Error for Infallible {
 }
 
 impl std::fmt::Display for Infallible {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         unreachable!()
     }
 }
@@ -43,5 +43,17 @@ impl std::error::Error for Error {}
 impl From<Error> for std::io::Error {
     fn from(value: Error) -> Self {
         value.0
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self(value)
+    }
+}
+
+impl From<std::io::ErrorKind> for Error {
+    fn from(value: std::io::ErrorKind) -> Self {
+        Self(value.into())
     }
 }
