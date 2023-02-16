@@ -82,15 +82,13 @@ impl Stream for QuicEndpoint {
         loop {
             state.poll_transmit(&self.inner.udp_state, cx);
             while let Some(msg) = state.recv_buffer.pop_front() {
+                log::trace!("received transmit");
                 match state
                     .endpoint
                     .handle(Instant::now(), msg.0, msg.1, msg.2, msg.3)
                 {
                     Some((handle, quinn_proto::DatagramEvent::ConnectionEvent(event))) => {
-                        match state.connections.get(&handle) {
-                            Some(conn) => conn.handle_event(event),
-                            None => log::error!("connection not found"),
-                        }
+                        state.send_event(handle, event);
                     }
                     Some((handle, quinn_proto::DatagramEvent::NewConnection(conn))) => {
                         let inner = ConnectionInner::new(handle, conn, &self.inner);
@@ -105,14 +103,7 @@ impl Stream for QuicEndpoint {
             {
                 log::trace!("event from connection {:?}: {:?}", handle, event);
                 if let Some(event) = state.endpoint.handle_event(handle, event) {
-                    state
-                        .connections
-                        .get_mut(&handle)
-                        .unwrap()
-                        .event_sender
-                        .clone()
-                        .try_send(event)
-                        .unwrap();
+                    state.send_event(handle, event);
                 }
             }
             match state.fill_recv_buffer(cx) {
@@ -154,6 +145,9 @@ struct EndpointState {
 }
 
 impl EndpointState {
+    pub fn send_event(&mut self, handle: quinn_proto::ConnectionHandle, event: quinn_proto::ConnectionEvent) {
+        self.connections.get_mut(&handle).unwrap().event_sender.clone().try_send(event).unwrap();
+    }
     fn poll_transmit(&mut self, udp_state: &quinn_udp::UdpState, cx: &mut Context) {
         for _ in 0..3 {
             while self.transmit_buffer.len() < self.transmit_buffer.capacity() {

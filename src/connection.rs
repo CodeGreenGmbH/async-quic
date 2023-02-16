@@ -124,11 +124,6 @@ impl ConnectionInner {
     pub(crate) fn is_handshaking(&self) -> bool {
         self.state.lock().unwrap().conn.is_handshaking()
     }
-    pub(crate) fn handle_event(&self, event: quinn_proto::ConnectionEvent) {
-        let mut state = self.state.lock().unwrap();
-        state.conn.handle_event(event);
-        state.drive_wake()
-    }
     pub(crate) fn poll_drive(self: &Arc<ConnectionInner>, cx: &mut Context<'_>) -> Poll<()> {
         let mut state = self.state.lock().unwrap();
         state.drive_waker = Some(cx.waker().clone());
