@@ -138,6 +138,7 @@ dependencies = [
  "bytes",
  "clap",
  "env_logger",
+ "event-listener",
  "futures",
  "h3",
  "http",

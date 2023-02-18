@@ -1,5 +1,5 @@
-mod h3;
-//mod echo;
+mod http3;
+mod quic;
 
 use crate::{QuicConnection, QuicEndpoint};
 use futures::{future::FusedFuture, prelude::*, select, stream::FuturesUnordered};
@@ -66,14 +66,24 @@ where
         )
         .unwrap();
     let connection = select! {
-        _ = ep.next() => panic!("unexpeced endpoint event"),
-        r = connecting => r.unwrap(),
+        _ = ep.next() => panic!("unexpeced endpoint item"),
+        c = connecting => c,
     };
-    let mut fut = f(connection);
-    select! {
-        _ = ep.next() => panic!("unexpeced endpoint event"),
-        r = fut => r,
-    }
+    let mut driver_fut = connection.driver();
+    let mut return_fut = f(connection);
+    let (mut driver_out, mut return_out) = (None, None);
+    let (driver_out, return_out) = loop {
+        select! {
+            _ = ep.next() => panic!("unexpeced endpoint item"),
+            d = driver_fut => driver_out = Some(d),
+            r = return_fut => return_out = Some(r),
+        };
+        if driver_out.is_some() && return_out.is_some() {
+            break (driver_out.unwrap(), return_out.unwrap());
+        }
+    };
+    driver_out.unwrap();
+    return_out
 }
 
 pub async fn handle<F, T, R>(mut ep: QuicEndpoint, f: F) -> R
@@ -84,30 +94,25 @@ where
     let mut connecting = FuturesUnordered::new();
     let mut handling = FuturesUnordered::new();
     let mut driving = FuturesUnordered::new();
+    let mut first_break = None;
     loop {
-        dbg!("handle");
-        if let ControlFlow::Break(r) = select! {
-            c = ep.next() => {
-                if let Some(c) = c {
-                    connecting.push(c);
-                }
-                ControlFlow::Continue(())
+        select! {
+            c = ep.next() => if let Some(c) = c {
+                connecting.push(c);
             },
-            c = connecting.next() => {
-                if let Some(c) = c {
-                    let c = c.unwrap();
-                    driving.push(c.driver());
-                    handling.push(f(c));
-                }
-                ControlFlow::Continue(())
+            c = connecting.next() => if let Some(c) = c {
+                driving.push(c.driver());
+                handling.push(f(c));
             },
-            _ = driving.next() => ControlFlow::Continue(()),
-            r = handling.next() => match r {
-                Some(r) => r,
-                None => ControlFlow::Continue(()),
+            r = driving.next() => if let Some(r) = r {
+                r.unwrap();
             },
-        } {
-            return r;
-        }
+            r = handling.next() => if let Some(ControlFlow::Break(b)) = r {
+                ep.reject_new_connections();
+                first_break.get_or_insert(b);
+            },
+            complete => break,
+        };
     }
+    first_break.unwrap()
 }

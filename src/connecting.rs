@@ -8,27 +8,22 @@ use futures::{future::FusedFuture, Future};
 
 use crate::{ConnectionInner, QuicConnection};
 
+#[derive(Debug)]
 pub struct QuicConnecting {
     pub(crate) inner: Option<Arc<ConnectionInner>>,
 }
 
 impl Future for QuicConnecting {
-    type Output = Result<QuicConnection, quinn_proto::ConnectionError>;
+    type Output = QuicConnection;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = self.inner.as_ref().unwrap();
-        if inner.poll_drive(cx).is_ready() {
-            todo!()
-        }
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.inner.take().unwrap();
+        _ = inner.poll_drive(cx);
         if inner.is_handshaking() {
+            self.inner = Some(inner);
             return Poll::Pending;
         }
-        let inner = inner.clone();
-        let conn = QuicConnection { inner };
-        if let Some(err) = conn.error() {
-            return Poll::Ready(Err(err));
-        }
-        Poll::Ready(Ok(conn))
+        Poll::Ready(QuicConnection { inner })
     }
 }
 

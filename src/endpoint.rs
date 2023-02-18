@@ -49,6 +49,7 @@ impl QuicEndpoint {
             transmit_buffer: VecDeque::with_capacity(quinn_udp::BATCH_SIZE),
             transmit_receiver,
             event_receiver,
+            reject_new_connections: false,
         });
         let inner = Arc::new(EndpointInner {
             state,
@@ -72,25 +73,32 @@ impl QuicEndpoint {
         let inner = Some(inner);
         return Ok(QuicConnecting { inner });
     }
+    pub fn reject_new_connections(&self) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.reject_new_connections = true;
+        state.endpoint.reject_new_connections();
+    }
 }
 
 impl Stream for QuicEndpoint {
     type Item = QuicConnecting;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        log::trace!("start poll_next");
         let mut state = self.inner.state.lock().unwrap();
         loop {
             state.poll_transmit(&self.inner.udp_state, cx);
             while let Some(msg) = state.recv_buffer.pop_front() {
-                log::trace!("received transmit");
                 match state
                     .endpoint
                     .handle(Instant::now(), msg.0, msg.1, msg.2, msg.3)
                 {
                     Some((handle, quinn_proto::DatagramEvent::ConnectionEvent(event))) => {
+                        log::trace!("incoming datagram for connection {:?}", handle);
                         state.send_event(handle, event);
                     }
                     Some((handle, quinn_proto::DatagramEvent::NewConnection(conn))) => {
+                        log::trace!("incoming connection: {:?}", handle);
                         let inner = ConnectionInner::new(handle, conn, &self.inner);
                         state.connections.insert(handle, inner.clone());
                         let inner = Some(inner);
@@ -102,9 +110,15 @@ impl Stream for QuicEndpoint {
             while let Poll::Ready(Some((handle, event))) = state.event_receiver.poll_next_unpin(cx)
             {
                 log::trace!("event from connection {:?}: {:?}", handle, event);
+                if event.is_drained() {
+                    state.connections.remove(&handle);
+                }
                 if let Some(event) = state.endpoint.handle_event(handle, event) {
                     state.send_event(handle, event);
                 }
+            }
+            if state.reject_new_connections && state.connections.is_empty() {
+                return Poll::Ready(None);
             }
             match state.fill_recv_buffer(cx) {
                 Poll::Ready(Ok(())) => {}
@@ -117,8 +131,8 @@ impl Stream for QuicEndpoint {
 
 impl FusedStream for QuicEndpoint {
     fn is_terminated(&self) -> bool {
-        // TODO
-        false
+        let state = self.inner.state.lock().unwrap();
+        state.reject_new_connections && state.connections.is_empty()
     }
 }
 
@@ -141,12 +155,23 @@ struct EndpointState {
         Option<quinn_proto::EcnCodepoint>,
         BytesMut,
     )>,
+    reject_new_connections: bool,
     endpoint: quinn_proto::Endpoint,
 }
 
 impl EndpointState {
-    pub fn send_event(&mut self, handle: quinn_proto::ConnectionHandle, event: quinn_proto::ConnectionEvent) {
-        self.connections.get_mut(&handle).unwrap().event_sender.clone().try_send(event).unwrap();
+    pub fn send_event(
+        &mut self,
+        handle: quinn_proto::ConnectionHandle,
+        event: quinn_proto::ConnectionEvent,
+    ) {
+        self.connections
+            .get_mut(&handle)
+            .unwrap()
+            .event_sender
+            .clone()
+            .try_send(event)
+            .unwrap();
     }
     fn poll_transmit(&mut self, udp_state: &quinn_udp::UdpState, cx: &mut Context) {
         for _ in 0..3 {
