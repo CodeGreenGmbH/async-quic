@@ -1,6 +1,7 @@
 use std::{
     io,
     pin::Pin,
+    process::abort,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -16,6 +17,12 @@ pub struct QuicStream<const R: bool, const W: bool> {
 }
 
 impl<const R: bool, const W: bool> QuicStream<R, W> {
+    pub(crate) const fn dir() -> quinn_proto::Dir {
+        match R & W {
+            true => quinn_proto::Dir::Bi,
+            false => quinn_proto::Dir::Uni,
+        }
+    }
     pub(crate) fn new(conn: Arc<ConnectionInner>, id: quinn_proto::StreamId) -> Self {
         Self {
             conn,
@@ -63,7 +70,8 @@ impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
     }
 
     fn reset(&mut self, reset_code: u64) {
-        todo!()
+        dbg!(reset_code);
+        abort()
     }
 
     fn id(&self) -> h3::quic::StreamId {
@@ -114,7 +122,8 @@ impl<const W: bool> h3::quic::RecvStream for QuicStream<true, W> {
     }
 
     fn stop_sending(&mut self, error_code: u64) {
-        todo!()
+        dbg!(error_code);
+        abort()
     }
 }
 
@@ -142,6 +151,7 @@ impl h3::quic::BidiStream<Bytes> for QuicStream<true, true> {
     type RecvStream = QuicStream<true, false>;
 
     fn split(self) -> (Self::SendStream, Self::RecvStream) {
-        todo!()
+        dbg!();
+        abort()
     }
 }

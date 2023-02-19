@@ -12,6 +12,7 @@ use std::{
     mem::MaybeUninit,
     net::{IpAddr, SocketAddr, UdpSocket},
     pin::Pin,
+    process::abort,
     sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Instant,
@@ -240,7 +241,8 @@ impl EndpointState {
                     if err.kind() != io::ErrorKind::ConnectionReset {
                         return Poll::Ready(Err(err));
                     }
-                    todo!()
+                    dbg!(err);
+                    abort();
                 }
             }
         }
