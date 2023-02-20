@@ -1,16 +1,15 @@
 use std::{
-    collections::BTreeMap,
-    ops::ControlFlow,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     time::Instant,
 };
 
-use crate::streams::Streams;
 use crate::{
-    error::{Infallible, QuicSendError},
-    streams::StreamHandle,
-    EndpointInner, QuicConnectionDriver, QuicStream,
+    error::QuicSendError, streams::StreamHandle, EndpointInner, QuicConnectionDriver, QuicStream,
+};
+use crate::{
+    error::{Infallible, QuicRecvError},
+    streams::Streams,
 };
 use async_io::Timer;
 use bytes::Bytes;
@@ -125,6 +124,10 @@ impl ConnectionInner {
             event_sender,
         })
     }
+    pub(crate) fn drop_stream_handle(&self, handle: StreamHandle) {
+        let mut state = self.state.lock().unwrap();
+        state.streams.drop_handle(handle);
+    }
     fn poll_accept<const R: bool, const W: bool>(
         self: &Arc<Self>,
         cx: &mut Context<'_>,
@@ -176,27 +179,43 @@ impl ConnectionInner {
         handle: &StreamHandle,
         cx: &mut Context<'_>,
         max_size: usize,
-    ) -> Poll<Result<Option<Bytes>, quinn_proto::VarInt>> {
+    ) -> Poll<Result<Option<Bytes>, QuicRecvError>> {
         let mut state = self.state.lock().unwrap();
-        let mut stream_state = state.streams.handle(handle);
+        let stream_state = state.streams.handle(handle);
+        let id = match stream_state.recv_id()? {
+            Some(id) => id,
+            None => return Poll::Ready(Ok(None)),
+        };
 
         let mut stream = state.conn.recv_stream(id);
-        let mut chunks = match stream.read(true) {
-            Ok(chunks) => chunks,
-            Err(_) => return Poll::Ready(Ok(None)),
-        };
+        let mut chunks = stream.read(true).unwrap();
         let p = match chunks.next(max_size) {
-            Ok(chunk) => Poll::Ready(Ok(chunk.map(|c| c.bytes))),
+            Ok(Some(chunk)) => Poll::Ready(Ok(Some(chunk.bytes))),
+            Ok(None) => Poll::Ready(Ok(None)),
             Err(quinn_proto::ReadError::Blocked) => Poll::Pending,
-            Err(quinn_proto::ReadError::Reset(err)) => Poll::Ready(Err(err)),
+            Err(quinn_proto::ReadError::Reset(err)) => Poll::Ready(Err(QuicRecvError::Reset(err))),
         };
         if chunks.finalize().should_transmit() {
             state.drive_wake();
         }
-        if p.is_pending() {
-            state.streams.get_mut(&id).unwrap().recv_waker = Some(cx.waker().clone());
+        let stream_state = state.streams.handle(handle);
+        match &p {
+            Poll::Pending => stream_state.set_recv_wake(cx),
+            Poll::Ready(Ok(None)) => stream_state.finished_recv(),
+            Poll::Ready(Err(QuicRecvError::Reset(err))) => stream_state.reset_recv(*err),
+            _ => {}
         }
         p
+    }
+    pub(crate) fn stop(&self, handle: &StreamHandle, error_code: quinn_proto::VarInt) {
+        let mut state = self.state.lock().unwrap();
+        let stream_state = state.streams.handle(handle);
+        if let Ok(Some(id)) = stream_state.recv_id() {
+            stream_state.stop_recv();
+            stream_state.recv_wake();
+            state.conn.recv_stream(id).stop(error_code).unwrap();
+            state.drive_wake();
+        }
     }
     pub(crate) fn poll_write(
         &self,
@@ -205,8 +224,7 @@ impl ConnectionInner {
         buf: &[u8],
     ) -> Poll<Result<usize, QuicSendError>> {
         let mut state = self.state.lock().unwrap();
-        let mut stream_state = state.streams.handle(handle);
-        let id = stream_state.send_id()?;
+        let id = state.streams.handle(handle).send_id()?;
         let mut send_stream = state.conn.send_stream(id);
         match send_stream.write(buf) {
             Ok(n) => {
@@ -214,17 +232,18 @@ impl ConnectionInner {
                 Poll::Ready(Ok(n))
             }
             Err(quinn_proto::WriteError::Blocked) => {
-                stream_state.set_send_wake(cx);
+                state.streams.handle(handle).set_send_wake(cx);
                 Poll::Pending
             }
-            Err(err) => unreachable!(err),
+            Err(err) => Err(err).unwrap(),
         }
     }
 
-    pub(crate) fn reset(&self, handle: quinn_proto::StreamId, error_code: quinn_proto::VarInt) {
+    pub(crate) fn reset(&self, handle: &StreamHandle, error_code: quinn_proto::VarInt) {
         let mut state = self.state.lock().unwrap();
-        let mut stream_state = state.streams.handle(handle);
+        let stream_state = state.streams.handle(handle);
         if let Ok(id) = stream_state.send_id() {
+            stream_state.reset_send();
             state.conn.send_stream(id).reset(error_code).unwrap();
             state.drive_wake();
         }
@@ -236,18 +255,18 @@ impl ConnectionInner {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), QuicSendError>> {
         let mut state = self.state.lock().unwrap();
-        let mut stream_state = state.streams.handle(handle);
+        let stream_state = state.streams.handle(handle);
         let id = match stream_state.send_id() {
             Ok(id) => Some(id),
             Err(QuicSendError::Finishing) => None,
             Err(QuicSendError::Finished) => return Poll::Ready(Ok(())),
-            err => return Poll::Ready(Err(err)),
-        }?;
+            Err(err) => return Poll::Ready(Err(err)),
+        };
+        stream_state.set_send_wake(cx);
         if let Some(id) = id {
-            stream_state.finished_send();
+            stream_state.finishing_send();
             state.conn.send_stream(id).finish().unwrap();
         }
-        stream_state.set_send_wake(cx);
         Poll::Pending
     }
 }
