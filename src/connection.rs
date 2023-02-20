@@ -1,12 +1,15 @@
 use std::{
     collections::BTreeMap,
+    ops::ControlFlow,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     time::Instant,
 };
 
+use crate::streams::Streams;
 use crate::{
-    error::{Error, Infallible},
+    error::{Infallible, QuicSendError},
+    streams::StreamHandle,
     EndpointInner, QuicConnectionDriver, QuicStream,
 };
 use async_io::Timer;
@@ -38,36 +41,14 @@ impl h3::quic::Connection<Bytes> for QuicConnection {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Option<Self::RecvStream>, Self::Error>> {
-        let mut state = self.inner.state.lock().unwrap();
-        if let Some(id) = state.conn.streams().accept(quinn_proto::Dir::Uni) {
-            log::debug!("{:?}: accepted recv stream: {:?}", state.conn.side(), id);
-            state.streams.insert(id, StreamState::default());
-            state.drive_wake();
-            return Poll::Ready(Ok(Some(QuicStream::<true, false>::new(
-                self.inner.clone(),
-                id,
-            ))));
-        }
-        state.opened_waker[quinn_proto::Dir::Uni as usize] = Some(cx.waker().clone());
-        Poll::Pending
+        self.inner.poll_accept(cx)
     }
 
     fn poll_accept_bidi(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Option<Self::BidiStream>, Self::Error>> {
-        let mut state = self.inner.state.lock().unwrap();
-        if let Some(id) = state.conn.streams().accept(quinn_proto::Dir::Bi) {
-            log::debug!("{:?}: accepted bidi stream: {:?}", state.conn.side(), id);
-            state.streams.insert(id, StreamState::default());
-            state.drive_wake();
-            return Poll::Ready(Ok(Some(QuicStream::<true, true>::new(
-                self.inner.clone(),
-                id,
-            ))));
-        }
-        state.opened_waker[quinn_proto::Dir::Uni as usize] = Some(cx.waker().clone());
-        Poll::Pending
+        self.inner.poll_accept(cx)
     }
 
     fn opener(&self) -> Self::OpenStreams {
@@ -86,14 +67,14 @@ impl h3::quic::OpenStreams<Bytes> for QuicConnection {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Self::BidiStream, Self::Error>> {
-        return self.inner.poll_open(cx);
+        self.inner.poll_open(cx)
     }
 
     fn poll_open_send(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Self::SendStream, Self::Error>> {
-        return self.inner.poll_open(cx);
+        self.inner.poll_open(cx)
     }
 
     fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
@@ -126,7 +107,7 @@ impl ConnectionInner {
         let state = Mutex::new(ConnectionState {
             conn,
             timer: None,
-            streams: BTreeMap::new(),
+            streams: Streams::default(),
             drive_waker: None,
             transmit_sender: endpoint.transmit_sender.clone(),
             queued_transmit: None,
@@ -144,17 +125,37 @@ impl ConnectionInner {
             event_sender,
         })
     }
+    fn poll_accept<const R: bool, const W: bool>(
+        self: &Arc<Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<QuicStream<R, W>>, Infallible>> {
+        let dir: quinn_proto::Dir = QuicStream::<R, W>::dir();
+        let mut state = self.state.lock().unwrap();
+        if let Some(id) = state.conn.streams().accept(dir) {
+            log::debug!(
+                "{:?}: accepted {:?} stream: {:?}",
+                state.conn.side(),
+                dir,
+                id
+            );
+            let handle = state.streams.create(id, R, W);
+            state.drive_wake();
+            return Poll::Ready(Ok(Some(QuicStream::new(self.clone(), handle, id))));
+        }
+        state.opened_waker[quinn_proto::Dir::Uni as usize] = Some(cx.waker().clone());
+        Poll::Pending
+    }
     fn poll_open<const R: bool, const W: bool>(
         self: &Arc<Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<QuicStream<R, W>, Infallible>> {
-        let mut state = self.state.lock().unwrap();
         let dir: quinn_proto::Dir = QuicStream::<R, W>::dir();
+        let mut state = self.state.lock().unwrap();
         if let Some(id) = state.conn.streams().open(dir) {
-            state.streams.insert(id, StreamState::default());
+            let handle = state.streams.create(id, R, W);
             log::debug!("{:?}: opened {:?} stream: {:?}", state.conn.side(), dir, id);
             state.drive_wake();
-            return Poll::Ready(Ok(QuicStream::new(self.clone(), id)));
+            return Poll::Ready(Ok(QuicStream::new(self.clone(), handle, id)));
         }
         state.opening_waker[dir as usize] = Some(cx.waker().clone());
         Poll::Pending
@@ -172,11 +173,13 @@ impl ConnectionInner {
     }
     pub(crate) fn poll_recv(
         &self,
-        id: quinn_proto::StreamId,
+        handle: &StreamHandle,
         cx: &mut Context<'_>,
         max_size: usize,
     ) -> Poll<Result<Option<Bytes>, quinn_proto::VarInt>> {
         let mut state = self.state.lock().unwrap();
+        let mut stream_state = state.streams.handle(handle);
+
         let mut stream = state.conn.recv_stream(id);
         let mut chunks = match stream.read(true) {
             Ok(chunks) => chunks,
@@ -197,47 +200,55 @@ impl ConnectionInner {
     }
     pub(crate) fn poll_write(
         &self,
-        id: quinn_proto::StreamId,
+        handle: &StreamHandle,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, Option<quinn_proto::VarInt>>> {
-        let mut guard = self.state.lock().unwrap();
-        guard.streams.get_mut(&id).unwrap().send_waker = None;
-        let mut send_stream = guard.conn.send_stream(id);
+    ) -> Poll<Result<usize, QuicSendError>> {
+        let mut state = self.state.lock().unwrap();
+        let mut stream_state = state.streams.handle(handle);
+        let id = stream_state.send_id()?;
+        let mut send_stream = state.conn.send_stream(id);
         match send_stream.write(buf) {
             Ok(n) => {
-                guard.drive_wake();
+                state.drive_wake();
                 Poll::Ready(Ok(n))
             }
             Err(quinn_proto::WriteError::Blocked) => {
-                guard.streams.get_mut(&id).unwrap().send_waker = Some(cx.waker().clone());
+                stream_state.set_send_wake(cx);
                 Poll::Pending
             }
-            Err(quinn_proto::WriteError::Stopped(err_code)) => Poll::Ready(Err(Some(err_code))),
-            Err(quinn_proto::WriteError::UnknownStream) => Poll::Ready(Err(None)),
+            Err(err) => unreachable!(err),
         }
     }
+
+    pub(crate) fn reset(&self, handle: quinn_proto::StreamId, error_code: quinn_proto::VarInt) {
+        let mut state = self.state.lock().unwrap();
+        let mut stream_state = state.streams.handle(handle);
+        if let Ok(id) = stream_state.send_id() {
+            state.conn.send_stream(id).reset(error_code).unwrap();
+            state.drive_wake();
+        }
+    }
+
     pub(crate) fn poll_finish(
         &self,
-        id: quinn_proto::StreamId,
+        handle: &StreamHandle,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Error>> {
+    ) -> Poll<Result<(), QuicSendError>> {
         let mut state = self.state.lock().unwrap();
-        match state.streams.get_mut(&id).unwrap().finished {
-            Some(true) => Poll::Ready(Ok(())),
-            Some(false) => {
-                state.streams.get_mut(&id).unwrap().send_waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-            None => {
-                state.conn.send_stream(id).finish().unwrap();
-                state.drive_wake();
-                let stream_state = state.streams.get_mut(&id).unwrap();
-                stream_state.finished = Some(false);
-                stream_state.send_waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
+        let mut stream_state = state.streams.handle(handle);
+        let id = match stream_state.send_id() {
+            Ok(id) => Some(id),
+            Err(QuicSendError::Finishing) => None,
+            Err(QuicSendError::Finished) => return Poll::Ready(Ok(())),
+            err => return Poll::Ready(Err(err)),
+        }?;
+        if let Some(id) = id {
+            stream_state.finished_send();
+            state.conn.send_stream(id).finish().unwrap();
         }
+        stream_state.set_send_wake(cx);
+        Poll::Pending
     }
 }
 
@@ -247,7 +258,7 @@ struct ConnectionState {
     conn: quinn_proto::Connection,
     timer: Option<Timer>,
     drive_waker: Option<Waker>,
-    streams: BTreeMap<quinn_proto::StreamId, StreamState>,
+    streams: Streams,
     queued_transmit: Option<quinn_proto::Transmit>,
     transmit_sender: Sender<quinn_proto::Transmit>,
     queued_endpoint_event: Option<quinn_proto::EndpointEvent>,
@@ -278,16 +289,6 @@ impl ConnectionState {
     fn drive_wake(&mut self) {
         self.drive_waker.take().map(Waker::wake);
     }
-    fn send_wake(&mut self, id: quinn_proto::StreamId) {
-        self.streams
-            .get_mut(&id)
-            .map(|s| s.send_waker.take().map(Waker::wake));
-    }
-    fn recv_wake(&mut self, id: quinn_proto::StreamId) {
-        self.streams
-            .get_mut(&id)
-            .map(|s| s.send_waker.take().map(Waker::wake));
-    }
     fn poll_drive(
         &mut self,
         cx: &mut Context,
@@ -312,13 +313,18 @@ impl ConnectionState {
                     quinn_proto::Event::DatagramReceived => {} // TODO: handle
                     quinn_proto::Event::Stream(event) => match event {
                         quinn_proto::StreamEvent::Opened { dir } => self.opened_wake(dir),
-                        quinn_proto::StreamEvent::Readable { id } => self.recv_wake(id),
-                        quinn_proto::StreamEvent::Writable { id } => self.send_wake(id),
-                        quinn_proto::StreamEvent::Finished { id } => {
-                            self.send_wake(id);
-                            self.streams.get_mut(&id).map(|s| s.finished = Some(true));
+                        quinn_proto::StreamEvent::Readable { id } => {
+                            self.streams.id(id).recv_wake()
                         }
-                        quinn_proto::StreamEvent::Stopped { id, .. } => self.recv_wake(id),
+                        quinn_proto::StreamEvent::Writable { id } => {
+                            self.streams.id(id).send_wake()
+                        }
+                        quinn_proto::StreamEvent::Finished { id } => {
+                            self.streams.id(id).finished_send()
+                        }
+                        quinn_proto::StreamEvent::Stopped { id, error_code } => {
+                            self.streams.id(id).stopped_send(error_code)
+                        }
                         quinn_proto::StreamEvent::Available { dir } => self.opening_wake(dir),
                     },
                 }
@@ -395,11 +401,4 @@ impl ConnectionState {
             _ = timer.poll_unpin(cx);
         }
     }
-}
-
-#[derive(Default, Debug)]
-struct StreamState {
-    send_waker: Option<Waker>,
-    recv_waker: Option<Waker>,
-    finished: Option<bool>,
 }

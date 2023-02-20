@@ -1,6 +1,5 @@
 use crate::{tests::handle, QuicConnection, QuicEndpoint, QuicStream};
-use async_io::Timer;
-use std::{future::poll_fn, ops::ControlFlow, time::Duration};
+use std::{future::poll_fn, ops::ControlFlow};
 use test_log::test;
 
 use super::{client, connect, server};

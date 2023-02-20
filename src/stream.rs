@@ -6,12 +6,17 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{error::Error, ConnectionInner};
+use crate::streams::StreamHandle;
+use crate::{
+    error::{Error, QuicSendError},
+    ConnectionInner,
+};
 use bytes::{Buf, Bytes};
 use futures::{prelude::*, ready};
 
 pub struct QuicStream<const R: bool, const W: bool> {
     conn: Arc<ConnectionInner>,
+    handle: StreamHandle,
     id: quinn_proto::StreamId,
     writing: Option<h3::quic::WriteBuf<Bytes>>,
 }
@@ -23,9 +28,14 @@ impl<const R: bool, const W: bool> QuicStream<R, W> {
             false => quinn_proto::Dir::Uni,
         }
     }
-    pub(crate) fn new(conn: Arc<ConnectionInner>, id: quinn_proto::StreamId) -> Self {
+    pub(crate) fn new(
+        conn: Arc<ConnectionInner>,
+        handle: StreamHandle,
+        id: quinn_proto::StreamId,
+    ) -> Self {
         Self {
             conn,
+            handle,
             id,
             writing: None,
         }
@@ -33,18 +43,13 @@ impl<const R: bool, const W: bool> QuicStream<R, W> {
 }
 
 impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
-    type Error = Error;
+    type Error = QuicSendError;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         while let Some(data) = &mut self.writing {
-            match ready!(self.conn.poll_write(self.id, cx, data.chunk())) {
+            match ready!(self.conn.poll_write(self.id, cx, data.chunk()))? {
                 Ok(n) => data.advance(n),
-                Err(err) => {
-                    return Poll::Ready(Err(match err {
-                        Some(reason) => io::ErrorKind::BrokenPipe.into(),
-                        None => io::ErrorKind::BrokenPipe.into(),
-                    }))
-                }
+                Err(err) => return Poll::Ready(Err(err)),
             }
             if !data.has_remaining() {
                 self.writing = None;
@@ -58,7 +63,7 @@ impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
         data: T,
     ) -> Result<(), Self::Error> {
         if self.writing.is_some() {
-            return Err(io::ErrorKind::WouldBlock.into());
+            return Err(QuicSendError::NotReady);
         }
         self.writing = Some(data.into());
         Ok(())
@@ -70,8 +75,8 @@ impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
     }
 
     fn reset(&mut self, reset_code: u64) {
-        dbg!(reset_code);
-        abort()
+        self.conn
+            .reset(self.id, quinn_proto::VarInt::try_from(reset_code).unwrap())
     }
 
     fn id(&self) -> h3::quic::StreamId {
@@ -133,15 +138,17 @@ impl<const W: bool> AsyncRead for QuicStream<true, W> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(match ready!(self.conn.poll_recv(self.id, cx, buf.len())) {
-            Ok(None) => Ok(0),
-            Err(_) => Err(io::ErrorKind::BrokenPipe.into()),
-            Ok(Some(mut b)) => {
-                let n = b.len();
-                b.copy_to_slice(&mut buf[0..n]);
-                Ok(n)
-            }
-        })
+        Poll::Ready(
+            match ready!(self.conn.poll_recv(&self.handle, cx, buf.len())) {
+                Ok(None) => Ok(0),
+                Err(_) => Err(io::ErrorKind::BrokenPipe.into()),
+                Ok(Some(mut b)) => {
+                    let n = b.len();
+                    b.copy_to_slice(&mut buf[0..n]);
+                    Ok(n)
+                }
+            },
+        )
     }
 }
 

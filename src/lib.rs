@@ -4,6 +4,7 @@ mod driver;
 mod endpoint;
 mod error;
 mod stream;
+mod streams;
 #[cfg(test)]
 mod tests;
 pub use connecting::*;

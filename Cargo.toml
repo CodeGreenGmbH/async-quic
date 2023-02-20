@@ -20,6 +20,8 @@ quinn-udp = "0.3.2"
 rustls = "0.20.8"
 h3 = { git = "https://github.com/FlorianUekermann/h3", branch="traits" }
 event-listener = "2.5.3"
+thiserror = { version = "1.0", default-features = false }
+slab = { version = "0.4.8", default-features = false }
 
 [dev-dependencies]
 simple_logger = "2.1.0"
