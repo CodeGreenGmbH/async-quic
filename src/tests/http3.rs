@@ -24,7 +24,6 @@ where
             let (mut h3_conn, sender) = h3::client::new(conn).await.unwrap();
             let mut driver = poll_fn(|cx| h3_conn.poll_close(cx).map(|r| r.unwrap())).fuse();
             let mut fut = f(sender).fuse();
-            dbg!();
             let ret = select! {
                 _ = driver => panic!("unexpected h3 conn close"),
                 r = fut => r,
@@ -43,18 +42,17 @@ where
     .await
 }
 
-pub async fn h3_handle<F, T, R>(ep: QuicEndpoint, f: F) -> R
+pub async fn h3_handle<F, T>(ep: QuicEndpoint, f: F)
 where
     F: Fn(http::Request<()>, h3::server::RequestStream<QuicStream<true, true>, Bytes>) -> T,
-    T: Future<Output = ControlFlow<R>>,
+    T: Future,
 {
     handle(ep, |conn| async {
         let mut conn = h3::server::Connection::new(conn).await.unwrap();
         let mut handling = FuturesUnordered::new();
         let mut done = false;
-        let mut ret = ControlFlow::Continue(());
+        let mut accept_fut = Box::pin(conn.accept().fuse());
         loop {
-            let mut accept_fut = Box::pin(conn.accept().fuse());
             if done {
                 accept_fut = Box::pin(Fuse::terminated());
             };
@@ -62,15 +60,11 @@ where
             dbg!(handling.is_terminated());
             select! {
                 a = accept_fut => match a.unwrap() {
+                    Some((req, stream)) => handling.push(f(req, stream)),
                     None => done = true,
-                    Some(a) => handling.push(f(a.0, a.1)),
                 },
-                r = handling.next() => if let Some(r) = r {
-                    if ret.is_continue() && r.is_break() {
-                        ret = r;
-                    }
-                },
-                complete => break ret,
+                _ = handling.next() => {},
+                complete => break ControlFlow::Break(())
             }
         }
     })
@@ -90,7 +84,6 @@ fn echo() {
             stream.send_response(resp).await.unwrap();
             stream.send_data(body.into()).await.unwrap();
             stream.finish().await.unwrap();
-            ControlFlow::<()>::Break(())
         })
         .fuse()
     });
@@ -115,7 +108,7 @@ fn echo() {
             while let Some(b) = stream.recv_data().await.unwrap() {
                 resp_body.extend_from_slice(b.chunk())
             }
-            resp_body
+            dbg!(resp_body)
         })
         .fuse()
     }));

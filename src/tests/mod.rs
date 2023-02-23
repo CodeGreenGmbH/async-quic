@@ -59,11 +59,7 @@ where
     T: Future<Output = R> + Unpin + FusedFuture,
 {
     let mut connecting = ep
-        .connect(
-            Arc::new(RUSTLS_CLIENT_CONFIG.clone()),
-            (Ipv6Addr::LOCALHOST, port).into(),
-            "localhost",
-        )
+        .connect(Arc::new(RUSTLS_CLIENT_CONFIG.clone()), (Ipv6Addr::LOCALHOST, port).into(), "localhost")
         .unwrap();
     let connection = select! {
         _ = ep.next() => panic!("unexpeced endpoint item"),

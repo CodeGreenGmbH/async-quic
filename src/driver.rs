@@ -5,12 +5,15 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::ConnectionInner;
+use crate::{
+    error::{QuicApplicationClose, QuicConnectionError},
+    ConnectionInner,
+};
 
 pub struct QuicConnectionDriver(pub(crate) Arc<ConnectionInner>, pub(crate) bool);
 
 impl Future for QuicConnectionDriver {
-    type Output = Result<Option<quinn_proto::ApplicationClose>, quinn_proto::ConnectionError>;
+    type Output = Result<QuicApplicationClose, QuicConnectionError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let p = self.0.poll_drive(cx);

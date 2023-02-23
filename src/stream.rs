@@ -1,5 +1,5 @@
 use std::{
-    io,
+    fmt, io,
     pin::Pin,
     process::abort,
     sync::Arc,
@@ -31,11 +31,7 @@ impl<const R: bool, const W: bool> QuicStream<R, W> {
             false => quinn_proto::Dir::Uni,
         }
     }
-    pub(crate) fn new(
-        conn: Arc<ConnectionInner>,
-        handle: StreamHandle,
-        id: quinn_proto::StreamId,
-    ) -> Self {
+    pub(crate) fn new(conn: Arc<ConnectionInner>, handle: StreamHandle, id: quinn_proto::StreamId) -> Self {
         Self {
             conn,
             handle,
@@ -59,10 +55,7 @@ impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
         Poll::Ready(Ok(()))
     }
 
-    fn send_data<T: Into<h3::quic::WriteBuf<Bytes>>>(
-        &mut self,
-        data: T,
-    ) -> Result<(), Self::Error> {
+    fn send_data<T: Into<h3::quic::WriteBuf<Bytes>>>(&mut self, data: T) -> Result<(), Self::Error> {
         if self.writing.is_some() {
             return Err(QuicSendError::NotReady);
         }
@@ -76,10 +69,7 @@ impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
     }
 
     fn reset(&mut self, reset_code: u64) {
-        self.conn.reset(
-            &self.handle,
-            quinn_proto::VarInt::try_from(reset_code).unwrap(),
-        )
+        self.conn.reset(&self.handle, quinn_proto::VarInt::try_from(reset_code).unwrap())
     }
 
     fn id(&self) -> h3::quic::StreamId {
@@ -88,16 +78,10 @@ impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
 }
 
 impl<const R: bool> AsyncWrite for QuicStream<R, true> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         use h3::quic::SendStream;
         _ = self.poll_ready(cx)?;
-        self.conn
-            .poll_write(&self.handle, cx, buf)
-            .map_err(Into::into)
+        self.conn.poll_write(&self.handle, cx, buf).map_err(Into::into)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -116,10 +100,7 @@ impl<const W: bool> h3::quic::RecvStream for QuicStream<true, W> {
 
     type Error = QuicRecvError;
 
-    fn poll_data(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<Option<Self::Buf>, Self::Error>> {
+    fn poll_data(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<Option<Self::Buf>, Self::Error>> {
         self.conn.poll_recv(&self.handle, cx, usize::MAX)
     }
 
@@ -129,22 +110,16 @@ impl<const W: bool> h3::quic::RecvStream for QuicStream<true, W> {
 }
 
 impl<const W: bool> AsyncRead for QuicStream<true, W> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        Poll::Ready(
-            match ready!(self.conn.poll_recv(&self.handle, cx, buf.len())) {
-                Ok(None) => Ok(0),
-                Err(err) => Err(err.into()),
-                Ok(Some(mut b)) => {
-                    let n = b.len();
-                    b.copy_to_slice(&mut buf[0..n]);
-                    Ok(n)
-                }
-            },
-        )
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        Poll::Ready(match ready!(self.conn.poll_recv(&self.handle, cx, buf.len())) {
+            Ok(None) => Ok(0),
+            Err(err) => Err(err.into()),
+            Ok(Some(mut b)) => {
+                let n = b.len();
+                b.copy_to_slice(&mut buf[0..n]);
+                Ok(n)
+            }
+        })
     }
 }
 
@@ -156,5 +131,12 @@ impl h3::quic::BidiStream<Bytes> for QuicStream<true, true> {
     fn split(self) -> (Self::SendStream, Self::RecvStream) {
         dbg!();
         abort()
+    }
+}
+
+impl<const W: bool, const R: bool> fmt::Debug for QuicStream<R, W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = format!("QuickStream<{},{}>", R, W);
+        f.debug_struct(&name).field("id", &self.id).finish_non_exhaustive()
     }
 }

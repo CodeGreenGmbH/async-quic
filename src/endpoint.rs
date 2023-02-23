@@ -25,21 +25,14 @@ pub struct QuicEndpoint {
 }
 
 impl QuicEndpoint {
-    pub fn new(
-        udp: UdpSocket,
-        server_config: Option<Arc<rustls::ServerConfig>>,
-    ) -> io::Result<Self> {
+    pub fn new(udp: UdpSocket, server_config: Option<Arc<rustls::ServerConfig>>) -> io::Result<Self> {
         quinn_udp::UdpSocketState::configure((&udp).into())?;
         let config = server_config.map(|c| Arc::new(quinn_proto::ServerConfig::with_crypto(c)));
         let endpoint = quinn_proto::Endpoint::new(Arc::new(Default::default()), config);
         let udp_state = Arc::new(quinn_udp::UdpState::new());
-        let recv_buf = vec![
-            0u8;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * udp_state.gro_segments()
-                * quinn_udp::BATCH_SIZE
-        ]
-        .into_boxed_slice();
+        let recv_buf =
+            vec![0u8; endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize * udp_state.gro_segments() * quinn_udp::BATCH_SIZE]
+                .into_boxed_slice();
         let (transmit_sender, transmit_receiver) = channel(quinn_udp::BATCH_SIZE);
         let (event_sender, event_receiver) = channel(quinn_udp::BATCH_SIZE);
         let state = Mutex::new(EndpointState {
@@ -90,10 +83,7 @@ impl Stream for QuicEndpoint {
         loop {
             state.poll_transmit(&self.inner.udp_state, cx);
             while let Some(msg) = state.recv_buffer.pop_front() {
-                match state
-                    .endpoint
-                    .handle(Instant::now(), msg.0, msg.1, msg.2, msg.3)
-                {
+                match state.endpoint.handle(Instant::now(), msg.0, msg.1, msg.2, msg.3) {
                     Some((handle, quinn_proto::DatagramEvent::ConnectionEvent(event))) => {
                         log::trace!("incoming datagram for connection {:?}", handle);
                         state.send_event(handle, event);
@@ -108,8 +98,7 @@ impl Stream for QuicEndpoint {
                     None => {}
                 }
             }
-            while let Poll::Ready(Some((handle, event))) = state.event_receiver.poll_next_unpin(cx)
-            {
+            while let Poll::Ready(Some((handle, event))) = state.event_receiver.poll_next_unpin(cx) {
                 log::trace!("event from connection {:?}: {:?}", handle, event);
                 if event.is_drained() {
                     state.connections.remove(&handle);
@@ -150,29 +139,14 @@ struct EndpointState {
     transmit_receiver: Receiver<quinn_proto::Transmit>,
     event_receiver: Receiver<(quinn_proto::ConnectionHandle, quinn_proto::EndpointEvent)>,
     transmit_buffer: VecDeque<quinn_proto::Transmit>,
-    recv_buffer: VecDeque<(
-        SocketAddr,
-        Option<IpAddr>,
-        Option<quinn_proto::EcnCodepoint>,
-        BytesMut,
-    )>,
+    recv_buffer: VecDeque<(SocketAddr, Option<IpAddr>, Option<quinn_proto::EcnCodepoint>, BytesMut)>,
     reject_new_connections: bool,
     endpoint: quinn_proto::Endpoint,
 }
 
 impl EndpointState {
-    pub fn send_event(
-        &mut self,
-        handle: quinn_proto::ConnectionHandle,
-        event: quinn_proto::ConnectionEvent,
-    ) {
-        self.connections
-            .get_mut(&handle)
-            .unwrap()
-            .event_sender
-            .clone()
-            .try_send(event)
-            .unwrap();
+    pub fn send_event(&mut self, handle: quinn_proto::ConnectionHandle, event: quinn_proto::ConnectionEvent) {
+        self.connections.get_mut(&handle).unwrap().event_sender.clone().try_send(event).unwrap();
     }
     fn poll_transmit(&mut self, udp_state: &quinn_udp::UdpState, cx: &mut Context) {
         for _ in 0..3 {
@@ -192,13 +166,7 @@ impl EndpointState {
             if self.transmit_buffer.is_empty() {
                 break;
             }
-            match poll_send(
-                &mut self.udp.1,
-                udp_state,
-                &self.udp.0,
-                cx,
-                self.transmit_buffer.make_contiguous(),
-            ) {
+            match poll_send(&mut self.udp.1, udp_state, &self.udp.0, cx, self.transmit_buffer.make_contiguous()) {
                 Poll::Ready(Ok(n)) => {
                     log::trace!("sent {} transmits", n);
                     drop(self.transmit_buffer.drain(0..n))
@@ -218,10 +186,7 @@ impl EndpointState {
                 .chunks_mut(self.udp.2.len() / quinn_udp::BATCH_SIZE)
                 .enumerate()
                 .for_each(|(i, buf)| unsafe {
-                    iovs.as_mut_ptr()
-                        .cast::<IoSliceMut>()
-                        .add(i)
-                        .write(IoSliceMut::<'a>::new(buf));
+                    iovs.as_mut_ptr().cast::<IoSliceMut>().add(i).write(IoSliceMut::<'a>::new(buf));
                 });
             let mut iovs = unsafe { iovs.assume_init() };
             match poll_recv(&self.udp.1, &self.udp.0, cx, &mut iovs, &mut metas) {
@@ -230,8 +195,7 @@ impl EndpointState {
                         let mut b: BytesMut = buf[0..meta.len].into();
                         while !b.is_empty() {
                             let b = b.split_to(meta.stride.min(b.len()));
-                            self.recv_buffer
-                                .push_back((meta.addr, meta.dst_ip, meta.ecn, b));
+                            self.recv_buffer.push_back((meta.addr, meta.dst_ip, meta.ecn, b));
                         }
                     }
                     return Poll::Ready(Ok(()));
