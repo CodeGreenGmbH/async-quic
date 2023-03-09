@@ -4,13 +4,7 @@ use test_log::test;
 
 use super::{client, connect, server};
 use bytes::{Buf, Bytes};
-use futures::{
-    future::{Fuse, FusedFuture},
-    join,
-    prelude::*,
-    select,
-    stream::{FusedStream, FuturesUnordered},
-};
+use futures::{future::FusedFuture, join, prelude::*, select, stream::FuturesUnordered};
 use http::{Method, Request, Response, Version};
 use smol::block_on;
 
@@ -28,13 +22,9 @@ where
                 _ = driver => panic!("unexpected h3 conn close"),
                 r = fut => r,
             };
-            dbg!();
             drop(driver);
             h3_conn.shutdown(0).await.unwrap();
-            dbg!();
             poll_fn(|cx| h3_conn.poll_close(cx)).await.unwrap();
-            dbg!();
-
             ret
         })
         .fuse()
@@ -50,29 +40,24 @@ where
     handle(ep, |conn| async {
         let mut conn = h3::server::Connection::new(conn).await.unwrap();
         let mut handling = FuturesUnordered::new();
-        let mut done = false;
         let mut accept_fut = Box::pin(conn.accept().fuse());
         loop {
-            if done {
-                accept_fut = Box::pin(Fuse::terminated());
-            };
-            dbg!(done, accept_fut.is_terminated());
-            dbg!(handling.is_terminated());
             select! {
                 a = accept_fut => match a.unwrap() {
                     Some((req, stream)) => handling.push(f(req, stream)),
-                    None => done = true,
+                    None => {},
                 },
                 _ = handling.next() => {},
-                complete => break ControlFlow::Break(())
+                complete => break
             }
         }
+        ControlFlow::Break(())
     })
     .await
 }
 
 #[test]
-fn echo() {
+fn h3_echo() {
     let (server, port) = server();
     let resp_fut = h3_handle(server, |_, mut stream| {
         Box::pin(async move {
@@ -108,7 +93,7 @@ fn echo() {
             while let Some(b) = stream.recv_data().await.unwrap() {
                 resp_body.extend_from_slice(b.chunk())
             }
-            dbg!(resp_body)
+            resp_body
         })
         .fuse()
     }));

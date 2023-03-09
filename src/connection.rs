@@ -196,6 +196,7 @@ impl ConnectionInner {
     }
     pub(crate) fn poll_write(&self, handle: &StreamHandle, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, QuicSendError>> {
         let mut state = self.state.lock().unwrap();
+        state.streams.handle(handle);
         let id = state.streams.handle(handle).send_id()?;
         let mut send_stream = state.conn.send_stream(id);
         match send_stream.write(buf) {
@@ -276,12 +277,11 @@ impl ConnectionState {
             if let Poll::Pending = self.poll_transmit(cx) {
                 break Poll::Pending;
             }
-            self.poll_timeout(cx);
             if let Poll::Pending = self.poll_endpoint_events(cx, handle) {
                 break Poll::Pending;
             };
 
-            while let Some(event) = self.conn.poll() {
+            if let Some(event) = self.conn.poll() {
                 log::debug!("{:?}: event: {:?}", self.conn.side(), event);
                 match event {
                     quinn_proto::Event::HandshakeDataReady => {}
@@ -303,6 +303,7 @@ impl ConnectionState {
                         quinn_proto::StreamEvent::Available { dir } => self.opening_wake(dir),
                     },
                 }
+                continue;
             }
 
             if let Poll::Ready(Some(event)) = self.event_receiver.poll_next_unpin(cx) {
@@ -311,20 +312,15 @@ impl ConnectionState {
                 continue;
             }
 
-            if let Some(timer) = &mut self.timer {
-                if timer.poll_unpin(cx).is_ready() {
-                    self.conn.handle_timeout(Instant::now());
-                    continue;
-                }
+            if self.poll_timeout(cx) {
+                continue;
             }
 
-            if self.conn.is_drained()
-                && !self.conn.has_pending_retransmits()
-                && self.queued_endpoint_event.is_none()
-                && self.queued_transmit.is_none()
-            {
+            if self.conn.is_drained() && self.timer.is_none() {
+                self.streams.reset_all();
                 break Poll::Ready(self.closed().unwrap());
             }
+
             break Poll::Pending;
         };
         log::trace!("{:?}: finish poll_drive: {:?}", self.conn.side(), p);
@@ -367,10 +363,19 @@ impl ConnectionState {
         }
         Poll::Ready(())
     }
-    fn poll_timeout(&mut self, cx: &mut Context) {
-        self.timer = self.conn.poll_timeout().map(Timer::at);
-        if let Some(timer) = &mut self.timer {
-            _ = timer.poll_unpin(cx);
+    fn poll_timeout(&mut self, cx: &mut Context) -> bool {
+        let mut handled = false;
+        loop {
+            self.timer = self.conn.poll_timeout().map(Timer::at);
+            if let Some(timer) = &mut self.timer {
+                if timer.poll_unpin(cx).is_ready() {
+                    self.conn.handle_timeout(Instant::now());
+                    handled = true;
+                    self.timer = None;
+                    continue;
+                }
+            }
+            return handled;
         }
     }
 }

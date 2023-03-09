@@ -70,7 +70,6 @@ fn many_streams() {
             for mut stream in streams.into_iter() {
                 stream.close().await.unwrap();
             }
-            //            async_io::Timer::after(std::time::Duration::from_secs(2)).await;
             conn.close(h3::error::Code::H3_NO_ERROR, &[]);
         })
         .fuse()

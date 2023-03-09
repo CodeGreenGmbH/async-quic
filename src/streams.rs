@@ -65,6 +65,16 @@ impl Streams {
         let idx = *self.id2idx.get(&id).unwrap();
         self.states.get_mut(idx).unwrap()
     }
+    pub(crate) fn reset_all(&mut self) {
+        for (_, state) in &mut self.states {
+            if state.w.is_some() && !state.reset_send {
+                state.reset_send();
+            }
+            if state.r.is_some() && state.reset_recv.is_none() {
+                state.reset_recv(quinn_proto::VarInt::MAX)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -139,14 +149,16 @@ impl StreamState {
         if let Some(error_code) = self.stopped_send {
             return Err(QuicSendError::Stopped(error_code));
         }
+        if let Some(complete) = self.finished_send {
+            return match complete {
+                false => Err(QuicSendError::Finishing),
+                true => Err(QuicSendError::Finished),
+            };
+        }
         if self.reset_send {
             return Err(QuicSendError::Reset);
         }
-        match self.finished_send {
-            Some(false) => Err(QuicSendError::Finishing),
-            Some(true) => Err(QuicSendError::Finished),
-            None => Ok(self.id),
-        }
+        Ok(self.id)
     }
     pub(crate) fn finished_recv(&mut self) {
         debug_assert!(self.r.is_some());
@@ -165,9 +177,12 @@ impl StreamState {
         if self.stopped_recv {
             return Err(QuicRecvError::Stopped);
         }
+        if self.finished_recv {
+            return Ok(None);
+        }
         if let Some(error_code) = self.reset_recv {
             return Err(QuicRecvError::Reset(error_code));
         }
-        Ok((!self.finished_recv).then_some(self.id))
+        Ok(Some(self.id))
     }
 }
