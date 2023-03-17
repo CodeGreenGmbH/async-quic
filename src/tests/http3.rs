@@ -1,33 +1,76 @@
-use crate::{tests::handle, QuicConnection, QuicEndpoint, QuicStream};
+use crate::{QuicConnection, QuicEndpoint, QuicStream};
 use std::{future::poll_fn, ops::ControlFlow};
 use test_log::test;
 
-use super::{client, connect, server};
+use crate::tests::*;
 use bytes::{Buf, Bytes};
 use futures::{future::FusedFuture, join, prelude::*, select, stream::FuturesUnordered};
 use http::{Method, Request, Response, Version};
 use smol::block_on;
+
+#[test]
+fn h3_client_shutdown() {
+    let (server, port) = server();
+    let server_fut = handle(server, |conn| async {
+        let mut conn = h3::server::Connection::new(conn).await.unwrap();
+        assert!(conn.accept().await.unwrap().is_none());
+        log::info!("Server: connection closed");
+        ControlFlow::Break(())
+    });
+
+    let client = client();
+    let client_fut = connect(client, port, |conn| async {
+        let (mut h3_conn, sender) = h3::client::new(conn).await.unwrap();
+        h3_conn.shutdown(0).await.unwrap();
+        log::info!("Client: shutdown");
+        poll_fn(|cx| h3_conn.poll_close(cx)).await.unwrap();
+        log::info!("Client: connection closed");
+        drop((h3_conn, sender))
+    });
+
+    block_on(async { join!(server_fut, client_fut) });
+}
+
+#[test]
+fn h3_server_shutdown() {
+    let (server, port) = server();
+    let server_fut = handle(server, |conn| async {
+        let mut conn = h3::server::Connection::new(conn).await.unwrap();
+        conn.shutdown(0).await.unwrap();
+        log::info!("Server: shutdown");
+        assert!(conn.accept().await.unwrap().is_none());
+        log::info!("Server: connection closed");
+        ControlFlow::Break(())
+    });
+
+    let client = client();
+    let client_fut = connect(client, port, |conn| async {
+        let (mut h3_conn, sender) = h3::client::new(conn).await.unwrap();
+        poll_fn(|cx| h3_conn.poll_close(cx)).await.unwrap();
+        log::info!("Client: connection closed");
+        drop((h3_conn, sender))
+    });
+
+    block_on(async { join!(server_fut, client_fut) });
+}
 
 pub async fn h3_connect<F, T, R>(ep: QuicEndpoint, port: u16, f: F) -> R
 where
     F: FnOnce(h3::client::SendRequest<QuicConnection, Bytes>) -> T,
     T: Future<Output = R> + Unpin + FusedFuture,
 {
-    connect(ep, port, |conn| {
-        Box::pin(async {
-            let (mut h3_conn, sender) = h3::client::new(conn).await.unwrap();
-            let mut driver = poll_fn(|cx| h3_conn.poll_close(cx).map(|r| r.unwrap())).fuse();
-            let mut fut = f(sender).fuse();
-            let ret = select! {
-                _ = driver => panic!("unexpected h3 conn close"),
-                r = fut => r,
-            };
-            drop(driver);
-            h3_conn.shutdown(0).await.unwrap();
-            poll_fn(|cx| h3_conn.poll_close(cx)).await.unwrap();
-            ret
-        })
-        .fuse()
+    connect(ep, port, |conn| async {
+        let (mut h3_conn, sender) = h3::client::new(conn).await.unwrap();
+        let mut driver = poll_fn(|cx| h3_conn.poll_close(cx).map(|r| r.unwrap())).fuse();
+        let mut fut = f(sender).fuse();
+        let ret = select! {
+            _ = driver => panic!("unexpected h3 conn close"),
+            r = fut => r,
+        };
+        drop(driver);
+        h3_conn.shutdown(0).await.unwrap();
+        poll_fn(|cx| h3_conn.poll_close(cx)).await.unwrap();
+        ret
     })
     .await
 }
@@ -51,6 +94,7 @@ where
                 complete => break
             }
         }
+        drop(());
         ControlFlow::Break(())
     })
     .await

@@ -1,6 +1,6 @@
 use std::{future::poll_fn, ops::ControlFlow};
 
-use crate::tests::{client, connect, handle, server};
+use crate::tests::*;
 use futures::{join, prelude::*};
 use h3::quic::*;
 use smol::block_on;

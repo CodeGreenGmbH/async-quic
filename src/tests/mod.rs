@@ -2,13 +2,15 @@ mod http3;
 mod quic;
 
 use crate::{QuicConnection, QuicEndpoint};
-use futures::{future::FusedFuture, prelude::*, select, stream::FuturesUnordered};
+use async_io::Timer;
+use futures::{prelude::*, select, stream::FuturesUnordered};
 use rcgen::generate_simple_self_signed;
 use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig};
 use std::{
     net::{Ipv6Addr, UdpSocket},
     ops::ControlFlow,
     sync::Arc,
+    time::Duration,
 };
 
 lazy_static::lazy_static! {
@@ -30,6 +32,10 @@ lazy_static::lazy_static! {
             .with_no_client_auth()
     };
 //    pub static ref QUIC_CLIENT_CONFIG: quinn_proto::ClientConfig = quinn_proto::ClientConfig::new(Arc::new(RUSTLS_CLIENT_CONFIG));
+}
+
+pub(crate) async fn sleep(secs: f64) {
+    Timer::after(Duration::from_secs_f64(secs)).await;
 }
 
 pub(crate) fn server() -> (QuicEndpoint, u16) {
@@ -56,7 +62,7 @@ pub(crate) fn client() -> QuicEndpoint {
 pub async fn connect<F, T, R>(mut ep: QuicEndpoint, port: u16, f: F) -> R
 where
     F: FnOnce(QuicConnection) -> T,
-    T: Future<Output = R> + Unpin + FusedFuture,
+    T: Future<Output = R>,
 {
     let mut connecting = ep
         .connect(Arc::new(RUSTLS_CLIENT_CONFIG.clone()), (Ipv6Addr::LOCALHOST, port).into(), "localhost")
@@ -66,7 +72,7 @@ where
         c = connecting => c,
     };
     let mut driver_fut = connection.driver();
-    let mut return_fut = f(connection);
+    let mut return_fut = Box::pin(f(connection)).fuse();
     let (mut driver_out, mut return_out) = (None, None);
     let (driver_out, return_out) = loop {
         select! {

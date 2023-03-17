@@ -14,13 +14,12 @@ use futures::{prelude::*, ready};
 pub struct QuicStream<const R: bool, const W: bool> {
     conn: Arc<ConnectionInner>,
     handle: StreamHandle,
-    id: quinn_proto::StreamId,
     writing: Option<h3::quic::WriteBuf<Bytes>>,
 }
 
 impl<const R: bool, const W: bool> Drop for QuicStream<R, W> {
     fn drop(&mut self) {
-        self.conn.drop_stream_handle(self.handle.extract());
+        self.conn.drop_stream_handle(&mut self.handle);
     }
 }
 
@@ -31,13 +30,8 @@ impl<const R: bool, const W: bool> QuicStream<R, W> {
             false => quinn_proto::Dir::Uni,
         }
     }
-    pub(crate) fn new(conn: Arc<ConnectionInner>, handle: StreamHandle, id: quinn_proto::StreamId) -> Self {
-        Self {
-            conn,
-            handle,
-            id,
-            writing: None,
-        }
+    pub(crate) fn new(conn: Arc<ConnectionInner>, handle: StreamHandle) -> Self {
+        Self { conn, handle, writing: None }
     }
 }
 
@@ -73,7 +67,9 @@ impl<const R: bool> h3::quic::SendStream<Bytes> for QuicStream<R, true> {
     }
 
     fn id(&self) -> h3::quic::StreamId {
-        self.id.index().try_into().unwrap()
+        let v: quinn_proto::VarInt = self.handle.id().into();
+        let v = v.into_inner();
+        v.try_into().unwrap()
     }
 }
 
@@ -137,6 +133,6 @@ impl h3::quic::BidiStream<Bytes> for QuicStream<true, true> {
 impl<const W: bool, const R: bool> fmt::Debug for QuicStream<R, W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = format!("QuickStream<{},{}>", R, W);
-        f.debug_struct(&name).field("id", &self.id).finish_non_exhaustive()
+        f.debug_struct(&name).field("id", &self.handle.id()).finish_non_exhaustive()
     }
 }

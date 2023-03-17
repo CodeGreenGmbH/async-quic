@@ -1,6 +1,6 @@
 use std::{
-    collections::BTreeMap,
-    mem::{forget, replace},
+    collections::{BTreeMap, VecDeque},
+    mem::replace,
     task::{Context, Waker},
 };
 
@@ -12,22 +12,32 @@ use crate::error::{QuicRecvError, QuicSendError};
 pub(crate) struct Streams {
     id2idx: BTreeMap<quinn_proto::StreamId, usize>,
     states: Slab<StreamState>,
+    opened: [VecDeque<StreamHandle>; 2],
+}
+
+impl Drop for Streams {
+    fn drop(&mut self) {
+        for i in 0..self.opened.len() {
+            while let Some(mut handle) = self.opened[i].pop_front() {
+                self.drop_handle(&mut handle);
+            }
+        }
+        assert!(self.states.is_empty());
+        assert!(self.id2idx.is_empty());
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct StreamHandle {
     idx: usize,
+    id: quinn_proto::StreamId,
     r: bool,
     w: bool,
 }
 
 impl StreamHandle {
-    pub(crate) fn extract(&mut self) -> StreamHandle {
-        StreamHandle {
-            idx: replace(&mut self.idx, usize::MAX),
-            r: self.r,
-            w: self.w,
-        }
+    pub fn id(&self) -> quinn_proto::StreamId {
+        self.id
     }
 }
 
@@ -40,39 +50,39 @@ impl Drop for StreamHandle {
 }
 
 impl Streams {
+    pub(crate) fn accept(&mut self, dir: quinn_proto::Dir) -> Option<StreamHandle> {
+        self.opened[dir as usize].pop_front()
+    }
+    pub(crate) fn opened(&mut self, id: quinn_proto::StreamId) {
+        let handle = self.create(id, true, id.dir() == quinn_proto::Dir::Bi);
+        self.opened[id.dir() as usize].push_back(handle);
+    }
     pub(crate) fn create(&mut self, id: quinn_proto::StreamId, r: bool, w: bool) -> StreamHandle {
         let state = StreamState::new(id, r, w);
         let idx = self.states.insert(state);
-        // TODO: May panic because quinn-proto doesn't seem to emit reset events.
         self.id2idx.insert(id, idx).ok_or(()).unwrap_err();
-        StreamHandle { idx, r, w }
+        StreamHandle { idx, id, r, w }
     }
-    pub(crate) fn drop_handle(&mut self, handle: StreamHandle) -> Option<StreamState> {
+    pub(crate) fn drop_handle(&mut self, handle: &mut StreamHandle) -> Option<StreamState> {
         let state = self.states.get_mut(handle.idx).unwrap();
         handle.r.then(|| state.r = Some(false));
         handle.w.then(|| state.w = Some(false));
-        forget(handle);
-        if state.r.unwrap_or(false) | state.w.unwrap_or(false) {
-            let idx = self.id2idx.remove(&state.id).unwrap();
-            return Some(self.states.remove(idx));
+        handle.idx = usize::MAX;
+        if state.r.unwrap_or(false) || state.w.unwrap_or(false) {
+            return None;
         }
-        None
+        let idx = self.id2idx.remove(&state.id).unwrap();
+        Some(self.states.remove(idx))
     }
     pub(crate) fn handle(&mut self, handle: &StreamHandle) -> &mut StreamState {
         self.states.get_mut(handle.idx).unwrap()
     }
     pub(crate) fn id(&mut self, id: quinn_proto::StreamId) -> &mut StreamState {
-        let idx = *self.id2idx.get(&id).unwrap();
-        self.states.get_mut(idx).unwrap()
+        self.states.get_mut(*self.id2idx.get(&id).unwrap()).unwrap()
     }
-    pub(crate) fn reset_all(&mut self) {
-        for (_, state) in &mut self.states {
-            if state.w.is_some() && !state.reset_send {
-                state.reset_send();
-            }
-            if state.r.is_some() && state.reset_recv.is_none() {
-                state.reset_recv(quinn_proto::VarInt::MAX)
-            }
+    pub(crate) fn wake_all(&mut self) {
+        for (_, state) in self.states.iter_mut() {
+            state.wake_all();
         }
     }
 }
@@ -86,9 +96,9 @@ pub(crate) struct StreamState {
     recv_waker: Option<Waker>,
     finished_send: Option<bool>,
     stopped_send: Option<quinn_proto::VarInt>,
-    reset_send: bool,
+    reset_send: Option<quinn_proto::VarInt>,
     finished_recv: bool,
-    stopped_recv: bool,
+    stopped_recv: Option<quinn_proto::VarInt>,
     reset_recv: Option<quinn_proto::VarInt>,
 }
 
@@ -102,10 +112,18 @@ impl StreamState {
             stopped_send: None,
             id,
             finished_recv: false,
-            stopped_recv: false,
-            reset_send: false,
+            stopped_recv: None,
+            reset_send: None,
             reset_recv: None,
             finished_send: None,
+        }
+    }
+    pub(crate) fn wake_all(&mut self) {
+        if self.w.is_some() {
+            self.send_wake()
+        }
+        if self.r.is_some() {
+            self.recv_wake()
         }
     }
     pub(crate) fn send_wake(&mut self) {
@@ -139,9 +157,9 @@ impl StreamState {
         debug_assert!(self.stopped_send.replace(error_code).is_none());
         self.send_wake();
     }
-    pub(crate) fn reset_send(&mut self) {
+    pub(crate) fn reset_send(&mut self, error_code: quinn_proto::VarInt) {
         debug_assert!(self.w.is_some());
-        debug_assert!(!replace(&mut self.reset_send, true));
+        debug_assert!(self.reset_send.replace(error_code).is_none());
         self.send_wake();
     }
     pub(crate) fn send_id(&self) -> Result<quinn_proto::StreamId, QuicSendError> {
@@ -155,8 +173,8 @@ impl StreamState {
                 true => Err(QuicSendError::Finished),
             };
         }
-        if self.reset_send {
-            return Err(QuicSendError::Reset);
+        if let Some(error_code) = self.reset_send {
+            return Err(QuicSendError::Reset(error_code));
         }
         Ok(self.id)
     }
@@ -168,14 +186,14 @@ impl StreamState {
         debug_assert!(self.r.is_some());
         debug_assert!(self.reset_recv.replace(error_code).is_none())
     }
-    pub(crate) fn stop_recv(&mut self) {
+    pub(crate) fn stop_recv(&mut self, error_code: quinn_proto::VarInt) {
         debug_assert!(self.r.is_some());
-        debug_assert!(!replace(&mut self.stopped_recv, true))
+        debug_assert!(self.stopped_recv.replace(error_code).is_none())
     }
     pub(crate) fn recv_id(&self) -> Result<Option<quinn_proto::StreamId>, QuicRecvError> {
         debug_assert!(self.r.is_some());
-        if self.stopped_recv {
-            return Err(QuicRecvError::Stopped);
+        if let Some(error_code) = self.stopped_recv {
+            return Err(QuicRecvError::Stopped(error_code));
         }
         if self.finished_recv {
             return Ok(None);
